@@ -14,10 +14,8 @@ import (
 // Builtins returns every compiled-in check. The caller filters by config
 // (module or check-ID enable) before running them.
 func Builtins() []model.Check {
-	all := []model.Check{
-		security.New(),
-		links.New(),
-	}
+	all := security.All()
+	all = append(all, links.New())
 	all = append(all, seo.All()...)
 	all = append(all, geo.All()...)
 	return all
