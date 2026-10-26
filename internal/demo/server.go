@@ -29,7 +29,7 @@ var assetsFS embed.FS
 const (
 	scansPerHour    = 5
 	rateLimitWindow = time.Hour
-	scanTimeout     = 15 * time.Second
+	scanTimeout     = 25 * time.Second // page (≤10s) + up to three sidecars (≤5s each)
 )
 
 // Options configures a Server. Store, TurnstileSiteKey, and
@@ -88,16 +88,14 @@ func NewServer(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("demo: %w", err)
 	}
 
-	// Only page-scoped checks run here — the demo has no Corpus and Fetch is
-	// deliberately unavailable (demoCheckContext.Fetch always errors), so any
-	// site-scoped check (broken-links, sitemap validity, hreflang
-	// reciprocity, bot posture, llms.txt) is filtered out automatically by
-	// scope rather than hand-maintained as an ID allowlist — it stays correct
-	// as new checks are added upstream without anyone remembering to update
-	// a list here.
+	// Every page-scoped check runs — they need nothing beyond the fetched
+	// page, so that filter is by scope and stays correct as checks are added
+	// upstream. Site-scoped checks run only when named in sidecarChecks:
+	// whether one is safe here depends on which URLs its code fetches, which
+	// its scope can't tell us (see sidecar.go).
 	var pageChecks []model.Check
 	for _, c := range allCandidateChecks() {
-		if c.Meta().Scope == model.ScopePage {
+		if m := c.Meta(); m.Scope == model.ScopePage || sidecarChecks[m.ID] {
 			pageChecks = append(pageChecks, c)
 		}
 	}
@@ -155,7 +153,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 var gaIDPattern = regexp.MustCompile(`^G-[A-Z0-9]{4,20}$`)
 
 func allCandidateChecks() []model.Check {
-	all := []model.Check{security.New()}
+	all := security.All()
 	all = append(all, seo.All()...)
 	all = append(all, geo.All()...)
 	return all
@@ -215,6 +213,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	started := time.Now()
 	ip := clientIP(r, s.ipHeader)
 	ctx, cancel := context.WithTimeout(r.Context(), scanTimeout)
 	defer cancel()
@@ -284,7 +283,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cc := &demoCheckContext{page: pd}
+	cc := newDemoCheckContext(ctx, pd)
 	var findings []model.Finding
 	for _, c := range s.checks {
 		fs, cerr := c.Run(cc)
@@ -303,11 +302,25 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		PassCount:  summary.Pass, SkipCount: summary.Skipped, InfoCount: summary.Info,
 	})
 
+	// The trace is the scan log the page replays: every request actually
+	// made, and every check actually run, in order. Nothing in it is
+	// decorative — the frontend paces it out, but doesn't add to it.
+	checks := make([]map[string]string, 0, len(s.checks))
+	for _, c := range s.checks {
+		m := c.Meta()
+		checks = append(checks, map[string]string{"id": m.ID, "module": m.Module, "title": m.Title})
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]any{
 		"url":      pd.FinalURL,
 		"summary":  summary,
 		"findings": findings,
+		"trace": map[string]any{
+			"page":      FetchEvent{What: "page", URL: pd.FinalURL, Status: pd.Status, Bytes: len(pd.Body), Ms: pd.TimingMs},
+			"fetches":   cc.trace,
+			"checks":    checks,
+			"elapsedMs": time.Since(started).Milliseconds(),
+		},
 	})
 }
 
@@ -323,7 +336,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 // log table.
 //
 // The write runs on a context detached from ctx's cancellation: the scan
-// context carries the 15s scan deadline, and a scan that timed out is exactly
+// context carries the scan deadline, and a scan that timed out is exactly
 // the outcome most worth recording — deriving from the expired ctx would fail
 // the write instead. id 0 means no row was reserved (no store, or the
 // reservation failed open), so there is nothing to finish.
@@ -336,23 +349,6 @@ func (s *Server) finishScan(ctx context.Context, id int64, e ScanLogEntry) {
 	if err := s.store.Finish(logCtx, id, e); err != nil {
 		log.Printf("demo: finish scan failed: %v", err)
 	}
-}
-
-// demoCheckContext wraps exactly one already-fetched page. Fetch is
-// deliberately unavailable — no check running in the public demo gets a
-// second network call, which is what keeps the whole endpoint down to one
-// hardened fetch path.
-type demoCheckContext struct{ page model.PageData }
-
-func (c *demoCheckContext) Scope() model.Scope       { return model.ScopePage }
-func (c *demoCheckContext) Page() model.PageData     { return c.page }
-func (c *demoCheckContext) Corpus() []model.PageData { return nil }
-func (c *demoCheckContext) Config() model.CheckConfig {
-	return model.CheckConfig{WCAGVersion: "2.2", WCAGLevel: "AA"}
-}
-func (c *demoCheckContext) Logf(string, ...any) {}
-func (c *demoCheckContext) Fetch(context.Context, string) (model.PageData, error) {
-	return model.PageData{}, errors.New("fetch is not available in the public demo — only the submitted page itself is checked")
 }
 
 // clientIP returns the visitor's address for rate limiting and Turnstile.

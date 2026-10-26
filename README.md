@@ -42,17 +42,24 @@ single static Go binary, so it runs anywhere from a Raspberry Pi to a CI runner.
 meant for public/marketing use — genuinely different from `verdict serve`, not
 just a flag on it:
 
-- **One fetch, hardened at dial time, not just at URL-check time.** The
+- **Every fetch hardened at dial time, not just at URL-check time.** The
   target's IP is validated both before connecting and again via a custom
   `DialContext` at the moment a connection actually opens — closing the
   DNS-rebinding gap where a hostname resolves to a public IP when checked and
   a private one moments later. Every redirect hop is re-validated the same way.
   Rejects loopback/private/link-local/multicast ranges (including the cloud
   metadata address, `169.254.169.254`).
-- **No config editing, no Fetch capability for checks, no crawling.** Only
-  page-scoped checks run (filtered by `Meta().Scope`, not a hand-maintained ID
-  list), and the demo's `CheckContext.Fetch` always errors — nothing a check
-  does can trigger a second network call.
+- **No config editing, no crawling, three fixed sidecar files.** Every
+  page-scoped check runs (filtered by `Meta().Scope`), plus the site-scoped
+  GEO checks named in `internal/demo/sidecar.go` — AI-crawler posture, Content
+  Signals and llms.txt. Besides the page, the demo's `CheckContext.Fetch` will
+  request only `/robots.txt`, `/llms.txt` and `/llms-full.txt`, only on the
+  page's own origin, at most three requests per scan (repeats are cached),
+  each through the same dial-time guard with a 500 KiB cap and a 5s timeout.
+  Any other URL is refused before a socket opens.
+- **The scan log is the real trace.** The response carries every request
+  made and every check run; the page replays it line by line with a short
+  floor on total time (Skip flushes it). Nothing in the log is invented.
 - **Rate-limited** (5 scans/hour/IP by default) and **optionally logs to
   Postgres** (`--database-url`, or `$DATABASE_URL`; a hashed IP, hostname, and
   finding counts only — no scraped content, no plaintext IP; the IP hash

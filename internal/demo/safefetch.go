@@ -1,12 +1,13 @@
 // Package demo implements the public, unauthenticated "try it live" scan
-// endpoint for the marketing site — a single visitor-submitted URL, fetched
-// once, checked, logged, shown. It is deliberately NOT built on
-// internal/engine's multi-fetch Fetcher: that's tuned for a trusted local
-// crawl (politeness, budget, cache across many fetches), and reusing it here
-// would multiply the SSRF surface across every URL a site-scoped check might
-// fetch (sitemap.xml, robots.txt, hreflang alternates...). The demo runs
-// exactly one fetch, through one hardened path, and only page-scoped checks
-// that need nothing beyond that one response.
+// endpoint for the marketing site — a single visitor-submitted URL, fetched,
+// checked, logged, shown. It is deliberately NOT built on internal/engine's
+// multi-fetch Fetcher: that's tuned for a trusted local crawl (politeness,
+// budget, cache across many fetches), and reusing it here would open the SSRF
+// surface to every URL a site-scoped check might want (sitemap.xml entries,
+// hreflang alternates, every link on the page...). The demo fetches the page
+// itself plus, at most, three fixed sidecar files on the SAME origin
+// (/robots.txt, /llms.txt, /llms-full.txt — see sidecar.go), every one through
+// this file's hardened path, and runs only the checks that need nothing more.
 package demo
 
 import (
@@ -49,6 +50,12 @@ var (
 //     "fetch a URL for the user" service. Redirects are validated the same way,
 //     per hop, for the same reason: a 302 is just another fetch.
 func safeFetch(ctx context.Context, rawURL string) (model.PageData, error) {
+	return safeFetchLimit(ctx, rawURL, maxBodyBytes)
+}
+
+// safeFetchLimit is safeFetch with a caller-chosen body cap — the sidecar
+// files (robots.txt, llms.txt) get a much smaller one than the page.
+func safeFetchLimit(ctx context.Context, rawURL string, maxBytes int64) (model.PageData, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return model.PageData{}, fmt.Errorf("invalid URL: %w", err)
@@ -107,7 +114,7 @@ func safeFetch(ctx context.Context, rawURL string) (model.PageData, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
 	if err != nil {
 		return model.PageData{}, fmt.Errorf("reading response: %w", err)
 	}
