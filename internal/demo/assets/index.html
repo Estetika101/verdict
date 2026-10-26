@@ -229,6 +229,64 @@ body::before {
 .status { min-height: 1.5em; margin: var(--space-3) 0 0; text-align: center; font-size: var(--text-sm); color: var(--color-muted); }
 .status.is-error { color: var(--color-error); }
 
+/* ---- scan log: the real trace, paced ---- */
+.log { margin: var(--space-6) auto 0; max-width: 720px; border: var(--rule-w) solid var(--color-rule); background: var(--color-panel); }
+.log-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: var(--rule-w) solid var(--color-rule-soft);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--track-caps);
+  text-transform: uppercase;
+  color: var(--color-muted);
+}
+.log-title { flex: 1; }
+.log-clock { font-family: var(--font-mono); letter-spacing: 0; color: var(--color-ink-2); font-variant-numeric: tabular-nums; }
+.log-skip {
+  padding: 2px var(--space-2);
+  border: var(--rule-w) solid var(--color-rule);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--color-muted);
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+}
+.log-skip:hover { color: var(--color-ink); border-color: var(--color-muted); }
+.log-skip:focus-visible { outline: 2px solid var(--color-select); outline-offset: 2px; }
+.log-skip:active { transform: translateY(1px); }
+.log-skip:disabled { opacity: 0.4; cursor: default; }
+.log-lines {
+  list-style: none;
+  margin: 0;
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  height: 280px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.75;
+}
+.log-line { display: flex; align-items: baseline; gap: var(--space-3); min-width: 0; animation: line-in var(--dur-med) var(--ease-out); }
+@keyframes line-in { from { opacity: 0; } to { opacity: 1; } }
+.log-tag { flex: 0 0 4.5ch; color: var(--color-faint); }
+.log-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-ink-2); }
+.log-lead { flex: 1 1 var(--space-4); min-width: var(--space-3); border-bottom: var(--rule-w) dotted var(--color-rule); transform: translateY(-4px); }
+.log-right { flex: 0 0 auto; color: var(--color-muted); white-space: nowrap; }
+.log-line.is-error .log-right { color: var(--color-error); }
+.log-line.is-warn .log-right { color: var(--color-warn); }
+.log-line.is-pass .log-right { color: var(--color-pass); }
+.log-line.is-info .log-right { color: var(--color-info); }
+.log-line.is-skipped .log-right { color: var(--color-skip); }
+.log-line.is-done .log-tag, .log-line.is-done .log-text { color: var(--color-ink); }
+.log-line.sig-sec .log-tag, .log-line.sig-seo .log-tag, .log-line.sig-geo .log-tag { color: var(--sig); }
+.log-line.is-pending .log-right::after { content: "…"; animation: blink 1s steps(2, start) infinite; }
+@keyframes blink { to { opacity: 0; } }
+@media (max-width: 480px) { .log-lead { display: none; } .log-text { flex: 1; } }
+
 /* ---- results ---- */
 .results { margin-top: var(--space-8); }
 .results:focus { outline: none; }
@@ -297,8 +355,8 @@ body::before {
 .f-required { margin: var(--space-1) 0 0; font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-muted); overflow-wrap: anywhere; }
 .f-fix { margin: var(--space-2) 0 0; font-size: var(--text-sm); color: var(--color-muted); overflow-wrap: anywhere; }
 .f-fix::before { content: "→ "; color: var(--color-faint); }
-.is-pass { padding: var(--space-3) 0; }
-.is-pass .f-criterion { color: var(--color-muted); }
+.finding.is-pass { padding: var(--space-3) 0; }
+.finding.is-pass .f-criterion { color: var(--color-muted); }
 .findings-empty { padding: var(--space-5) 0; text-align: center; color: var(--color-muted); font-size: var(--text-sm); }
 
 /* ---- footer sleeve ---- */
@@ -336,7 +394,7 @@ body::before {
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
 @media (prefers-reduced-motion: reduce) {
-  .flow, .scan.is-scanning .progress span { animation: none; }
+  .flow, .scan.is-scanning .progress span, .log-line, .log-line.is-pending .log-right::after { animation: none; }
   .scan.is-scanning .progress span { transform: none; width: 100%; opacity: 0.6; }
   * { transition-duration: 1ms !important; }
 }
@@ -374,11 +432,11 @@ body::before {
     <ul class="legend">
       <li class="sig-sec"><span class="legend-name">Security</span><span class="legend-range">Headers · transport</span></li>
       <li class="sig-seo"><span class="legend-name">SEO</span><span class="legend-range">On-page · social</span></li>
-      <li class="sig-geo"><span class="legend-name">GEO</span><span class="legend-range">AI answers · freshness</span></li>
+      <li class="sig-geo"><span class="legend-name">GEO</span><span class="legend-range">AI crawlers · answers</span></li>
     </ul>
 
     <h1 class="statement"><span class="line">Your page sends <b>three</b> signals.</span> <span class="line">Read each one.</span></h1>
-    <p class="lede">Paste a URL. Verdict fetches that one page and checks its security headers, SEO basics and AI-answer readiness. No account.</p>
+    <p class="lede">Paste a URL. Verdict reads the page, its robots.txt and its llms.txt, then checks security, SEO basics and AI-answer readiness. No account.</p>
 
     <form class="scan" id="scanForm" novalidate>
       <label class="scan-label" for="urlInput">URL to scan</label>
@@ -388,9 +446,18 @@ body::before {
       </div>
       <div class="progress" aria-hidden="true"><span></span></div>
       <div class="turnstile" id="turnstileWidget"></div>
-      <p class="hint">One page per scan · public sites only</p>
+      <p class="hint">One page plus its robots.txt and llms.txt · public sites only</p>
       <p class="status" id="status" role="status" aria-live="polite"></p>
     </form>
+
+    <section class="log" id="scanLog" hidden aria-label="Scan log">
+      <div class="log-head">
+        <span class="log-title">Scan log</span>
+        <span class="log-clock" id="logClock">00.0 s</span>
+        <button class="log-skip" id="logSkip" type="button">Skip</button>
+      </div>
+      <ol class="log-lines" id="logLines" aria-live="off"></ol>
+    </section>
 
     <section class="results" id="results" hidden tabindex="-1" aria-labelledby="scanHost">
       <hr class="rule">

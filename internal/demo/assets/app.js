@@ -172,10 +172,13 @@
     return parts.join(' · ');
   }
 
-  // Criteria arrive as either human names ("Referrer-Policy") or check slugs
-  // ("seo-meta-desc-length"); strip the redundant module prefix from slugs.
+  // Criteria arrive as either human names ("Referrer-Policy") or check IDs
+  // ("security-sri"). An ID shows as its check's title from the scan trace;
+  // failing that, the slug minus its redundant module prefix.
+  var checkTitles = {};
   function criterionLabel(f) {
     var c = f.criterion || f.module || '';
+    if (checkTitles[c]) return checkTitles[c];
     var prefix = (f.module || '') + '-';
     if (prefix.length > 1 && c.indexOf(prefix) === 0) c = c.slice(prefix.length).replace(/-/g, ' ');
     return c;
@@ -296,7 +299,8 @@
     try { host = new URL(data.url).host; } catch (e) { /* show the raw URL */ }
     els.host.textContent = host;
     els.url.textContent = data.url;
-    els.count.textContent = findings.length + (findings.length === 1 ? ' check' : ' checks');
+    var nChecks = ((data.trace || {}).checks || []).length;
+    els.count.textContent = (nChecks ? nChecks + ' checks · ' : '') + findings.length + (findings.length === 1 ? ' result' : ' results');
 
     els.panels.textContent = '';
     MODULES.forEach(function (m) { els.panels.appendChild(panel(m, byModule[m.id], hash(m.id + data.url))); });
@@ -382,6 +386,143 @@
     els.button.textContent = on ? 'Scanning' : 'Scan';
   }
 
+  // ------------------------------------------------------------ scan log --
+
+  // The scan log replays what the server actually did — each request it made
+  // and each check it ran, with that check's real result — paced so the work
+  // is visible instead of the answer just appearing. It invents nothing:
+  // while the request is in flight it shows only the two steps already under
+  // way server-side (the public-address guard and the page fetch), marked
+  // pending; everything after that comes from the response's trace. Skip
+  // flushes the rest at once.
+  var MIN_SCAN_MS = 6500;   // floor from submit to results, network wait included
+  var MIN_GAP_MS = 45;      // fastest a check line may land
+  var MAX_GAP_MS = 220;     // slowest
+
+  var log = {
+    el: document.getElementById('scanLog'),
+    lines: document.getElementById('logLines'),
+    clock: document.getElementById('logClock'),
+    skip: document.getElementById('logSkip'),
+    t0: 0, timer: null, skipping: false, wake: []
+  };
+  var TAG = { security: 'SEC', seo: 'SEO', geo: 'GEO' };
+  var MOD_CLS = { security: 'sig-sec', seo: 'sig-seo', geo: 'sig-geo' };
+
+  function logLine(tag, text, right, cls) {
+    var li = h('li', 'log-line' + (cls ? ' ' + cls : ''));
+    li.appendChild(h('span', 'log-tag', tag));
+    li.appendChild(h('span', 'log-text', text));
+    li.appendChild(h('span', 'log-lead'));
+    li.appendChild(h('span', 'log-right', right || ''));
+    log.lines.appendChild(li);
+    log.lines.scrollTop = log.lines.scrollHeight;
+    return li;
+  }
+  function settle(li, right, cls) {
+    li.classList.remove('is-pending');
+    if (cls) li.classList.add(cls);
+    li.querySelector('.log-right').textContent = right;
+  }
+  function tickClock() {
+    var t = (performance.now() - log.t0) / 1000;
+    log.clock.textContent = (t < 10 ? '0' : '') + t.toFixed(1) + ' s';
+  }
+  function logStart() {
+    log.lines.textContent = '';
+    log.el.hidden = false;
+    log.skipping = false;
+    log.skip.disabled = false;
+    log.t0 = performance.now();
+    clearInterval(log.timer);
+    log.timer = setInterval(tickClock, 100);
+    tickClock();
+  }
+  function logStop() {
+    clearInterval(log.timer);
+    tickClock();
+    log.skip.disabled = true;
+  }
+
+  // A delay the Skip button can cut short.
+  function wait(ms) {
+    if (log.skipping || ms <= 0) return Promise.resolve();
+    return new Promise(function (resolve) {
+      var t = setTimeout(done, ms);
+      log.wake.push(done);
+      function done() { clearTimeout(t); resolve(); }
+    });
+  }
+  log.skip.addEventListener('click', function () {
+    log.skipping = true;
+    log.skip.disabled = true;
+    var pending = log.wake;
+    log.wake = [];
+    pending.forEach(function (f) { f(); });
+  });
+
+  // steps: [[fn, msAfter], …], run in order.
+  function pace(steps) {
+    return steps.reduce(function (p, step) {
+      return p.then(function () { step[0](); return wait(step[1]); });
+    }, Promise.resolve());
+  }
+
+  function size(n) { return n < 1024 ? n + ' B' : (n / 1024).toFixed(1) + ' KB'; }
+  function fetchResult(ev) {
+    if (ev.error) return ev.error;
+    return ev.status + ' · ' + size(ev.bytes || 0) + ' · ' + ev.ms + ' ms';
+  }
+
+  function replay(data, addrLine, pageLine) {
+    var tr = data.trace || {};
+    checkTitles = {};
+    (tr.checks || []).forEach(function (c) { checkTitles[c.id] = c.title; });
+    settle(addrLine, 'public', 'is-pass');
+    settle(pageLine, fetchResult(tr.page || {}));
+
+    var steps = [];
+    (tr.fetches || []).forEach(function (ev) {
+      steps.push([function () { logLine('GET', ev.what, fetchResult(ev), ev.error ? 'is-skipped' : ''); }, 320]);
+    });
+
+    var checks = tr.checks || [];
+    var mods = MODULES.filter(function (m) {
+      return checks.some(function (c) { return c.module === m.id; });
+    }).map(function (m) { return m.name; });
+    steps.push([function () { logLine('RUN', checks.length + ' checks · ' + mods.join(', '), ''); }, 360]);
+
+    var findings = data.findings || [];
+    var ordered = [];
+    MODULES.forEach(function (m) {
+      findings.forEach(function (f) { if (f.module === m.id) ordered.push(f); });
+    });
+    // Spread the check lines over whatever is left of the floor, within
+    // sensible per-line bounds — a big result scrolls faster, a small one
+    // doesn't crawl.
+    var fixed = steps.reduce(function (a, st) { return a + st[1]; }, 0);
+    var left = MIN_SCAN_MS - (performance.now() - log.t0) - fixed;
+    var gap = Math.round(Math.max(MIN_GAP_MS, Math.min(MAX_GAP_MS, left / Math.max(1, ordered.length))));
+    ordered.forEach(function (f) {
+      var k = statusKey(f);
+      steps.push([function () {
+        logLine(TAG[f.module] || String(f.module).toUpperCase(), criterionLabel(f), LABEL[k] || k, 'is-' + k + ' ' + (MOD_CLS[f.module] || ''));
+      }, gap]);
+    });
+
+    steps.push([function () {
+      var t = tally(findings);
+      logLine('DONE', (t.error + t.warn) + ' to fix · ' + t.pass + ' pass · ' + t.info + ' info',
+        'server ' + ((tr.elapsedMs || 0) / 1000).toFixed(2) + ' s', 'is-done');
+      logStop();
+    }, 500]);
+    return pace(steps);
+  }
+
+  function hostOf(raw) {
+    try { return new URL(raw.indexOf('://') < 0 ? 'https://' + raw : raw).host || raw; } catch (e) { return raw; }
+  }
+
   els.input.addEventListener('input', function () {
     els.input.removeAttribute('aria-invalid');
     if (els.status.classList.contains('is-error')) setStatus('', false);
@@ -402,7 +543,11 @@
     }
 
     setScanning(true);
-    setStatus('Reading the signal…', false);
+    setStatus('Scanning ' + hostOf(url) + '…', false);
+    els.results.hidden = true;
+    logStart();
+    var addrLine = logLine('ADDR', hostOf(url) + ' · public-address check', '', 'is-pending');
+    var pageLine = logLine('GET', 'page', '', 'is-pending');
 
     fetch('/api/scan', {
       method: 'POST',
@@ -421,13 +566,19 @@
         return r.json();
       })
       .then(function (data) {
-        setScanning(false);
-        setStatus('', false);
-        render(data);
-        track('ok');
+        return replay(data, addrLine, pageLine).then(function () {
+          setScanning(false);
+          setStatus('', false);
+          render(data);
+          track('ok');
+        });
       })
       .catch(function (err) {
         setScanning(false);
+        if (addrLine.classList.contains('is-pending')) settle(addrLine, '—', 'is-skipped');
+        if (pageLine.classList.contains('is-pending')) settle(pageLine, '—', 'is-skipped');
+        logLine('STOP', err.message || 'The scan failed.', '', 'is-error');
+        logStop();
         track(err.status === 429 ? 'rate_limited' : err.status === 403 ? 'not_verified' : 'error');
         if (err.badInput) els.input.setAttribute('aria-invalid', 'true');
         setStatus(err.message || 'The scan failed. Try again.', true);
