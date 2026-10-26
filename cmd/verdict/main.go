@@ -60,6 +60,7 @@ func runDemo(args []string, stdout, stderr *os.File) int {
 	turnstileHostnames := fs.String("turnstile-hostnames", os.Getenv("TURNSTILE_HOSTNAMES"), "comma-separated hostnames a Turnstile token may have been solved on, i.e. this demo's own domain (defaults to $TURNSTILE_HOSTNAMES; required when Turnstile is on)")
 	ipHashSecret := fs.String("ip-hash-secret", os.Getenv("IP_HASH_SECRET"), "secret that keys the stored IP hash (defaults to $IP_HASH_SECRET); without one the hash is unkeyed SHA-256, which can be reversed by brute force, and a warning is logged")
 	clientIPHeader := fs.String("client-ip-header", os.Getenv("CLIENT_IP_HEADER"), "request header carrying the visitor's IP, trusted for rate limiting (defaults to $CLIENT_IP_HEADER): \"Fly-Client-IP\" on Fly, \"X-Real-IP\" on Vercel, empty when exposed directly (uses the connection address)")
+	gaID := fs.String("ga-measurement-id", os.Getenv("GA_MEASUREMENT_ID"), "Google Analytics 4 measurement ID, G-XXXXXXXXXX (optional; defaults to $GA_MEASUREMENT_ID; no analytics script loads when empty)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -92,6 +93,7 @@ func runDemo(args []string, stdout, stderr *os.File) int {
 		TurnstileSecretKey: *turnstileSecretKey,
 		TurnstileHostnames: demo.ParseHostnames(*turnstileHostnames),
 		ClientIPHeader:     *clientIPHeader,
+		GAMeasurementID:    *gaID,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, err)

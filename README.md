@@ -73,7 +73,7 @@ just a flag on it:
   / `--turnstile-secret`, or `$TURNSTILE_SITE_KEY` / `$TURNSTILE_SECRET_KEY`).
   Off unless BOTH keys are set — a site key alone would render a widget
   nothing actually checks. The widget loads dynamically (the frontend fetches
-  `/api/turnstile-sitekey` and only injects Cloudflare's script if a key comes
+  `/api/config` and only injects Cloudflare's script if a key comes
   back), so a deploy without Turnstile configured behaves exactly as if this
   feature didn't exist. With Turnstile on, `--turnstile-hostnames` /
   `$TURNSTILE_HOSTNAMES` (comma-separated, this demo's own domain) is
@@ -82,6 +82,12 @@ just a flag on it:
   sharing the key is refused. The server won't start with keys but no
   hostnames. Malformed tokens (empty, over 2048 chars) are rejected before
   calling Cloudflare, and the verify call has its own 10s timeout.
+- **Optional Google Analytics 4** (`--ga-measurement-id` /
+  `$GA_MEASUREMENT_ID`). Off unless set: no gtag script loads and the CSP
+  doesn't admit Google's hosts, so a self-hosted demo never reports to
+  anyone's analytics by default. When on, the page sends GA4's page view
+  plus one `scan` event per attempt carrying only the outcome (`ok`,
+  `error`, `rate_limited`, `not_verified`), never the scanned URL.
 - **Security headers on every response**: a strict Content-Security-Policy
   (scripts from this origin and Cloudflare Turnstile only), `nosniff`,
   `X-Frame-Options: DENY`, HSTS, a restrictive Referrer-Policy and

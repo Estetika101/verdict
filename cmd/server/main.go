@@ -53,6 +53,7 @@ func main() {
 		TurnstileSecretKey: os.Getenv("TURNSTILE_SECRET_KEY"),
 		TurnstileHostnames: demo.ParseHostnames(os.Getenv("TURNSTILE_HOSTNAMES")),
 		ClientIPHeader:     clientIPHeader,
+		GAMeasurementID:    os.Getenv("GA_MEASUREMENT_ID"),
 	})
 	if err != nil {
 		log.Fatalf("server: %v", err)

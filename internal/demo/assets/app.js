@@ -315,31 +315,58 @@
 
   // ---------------------------------------------------------------- form --
 
-  // Turnstile is optional and server-driven: an empty site key means no
-  // script, no widget, and a page that behaves as if this didn't exist.
+  // Third-party scripts are optional and server-driven via /api/config: an
+  // empty Turnstile site key or GA4 ID means no script at all, and a page
+  // that behaves as if the feature didn't exist.
   var turnstile = { active: false, token: '', widget: null };
 
-  fetch('/api/turnstile-sitekey')
+  // GA4, loaded the way Google's snippet does it, minus the inline <script>
+  // the CSP forbids. gtag must push the arguments object itself, not an
+  // array — that's what gtag.js reads off dataLayer.
+  function setupAnalytics(id) {
+    if (!id) return;
+    window.dataLayer = window.dataLayer || [];
+    window.gtag = function () { window.dataLayer.push(arguments); };
+    window.gtag('js', new Date());
+    window.gtag('config', id);
+    var script = document.createElement('script');
+    script.async = true;
+    script.src = 'https://www.googletagmanager.com/gtag/js?id=' + encodeURIComponent(id);
+    document.head.appendChild(script);
+  }
+
+  // One event per scan attempt, carrying only the outcome — never the URL
+  // the visitor typed, which is theirs, not ours to hand to Google.
+  function track(outcome) {
+    if (typeof window.gtag === 'function') window.gtag('event', 'scan', { outcome: outcome });
+  }
+
+  function setupTurnstile(data) {
+    if (!data.sitekey) return;
+    turnstile.active = true;
+    var script = document.createElement('script');
+    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    script.async = true;
+    script.onload = function () {
+      turnstile.widget = window.turnstile.render('#turnstileWidget', {
+        sitekey: data.sitekey,
+        action: data.action,
+        theme: 'dark',
+        callback: function (token) { turnstile.token = token; },
+        'expired-callback': function () { turnstile.token = ''; },
+        'error-callback': function () { turnstile.token = ''; }
+      });
+    };
+    document.head.appendChild(script);
+  }
+
+  fetch('/api/config')
     .then(function (r) { return r.json(); })
     .then(function (data) {
-      if (!data.sitekey) return;
-      turnstile.active = true;
-      var script = document.createElement('script');
-      script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-      script.async = true;
-      script.onload = function () {
-        turnstile.widget = window.turnstile.render('#turnstileWidget', {
-          sitekey: data.sitekey,
-          action: data.action,
-          theme: 'dark',
-          callback: function (token) { turnstile.token = token; },
-          'expired-callback': function () { turnstile.token = ''; },
-          'error-callback': function () { turnstile.token = ''; }
-        });
-      };
-      document.head.appendChild(script);
+      setupAnalytics(data.gaMeasurementId);
+      setupTurnstile(data);
     })
-    .catch(function () { /* fail open to no widget, not a broken page */ });
+    .catch(function () { /* fail open to no widget and no analytics, not a broken page */ });
 
   function setStatus(text, isError) {
     els.status.textContent = text;
@@ -387,6 +414,7 @@
           return r.text().then(function (t) {
             var err = new Error((t || '').trim() || 'The scan failed (HTTP ' + r.status + '). Try again.');
             err.badInput = r.status === 400;
+            err.status = r.status;
             throw err;
           });
         }
@@ -396,9 +424,11 @@
         setScanning(false);
         setStatus('', false);
         render(data);
+        track('ok');
       })
       .catch(function (err) {
         setScanning(false);
+        track(err.status === 429 ? 'rate_limited' : err.status === 403 ? 'not_verified' : 'error');
         if (err.badInput) els.input.setAttribute('aria-invalid', 'true');
         setStatus(err.message || 'The scan failed. Try again.', true);
         els.input.focus();

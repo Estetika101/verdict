@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -60,6 +61,11 @@ type Options struct {
 	TurnstileSecretKey string
 	TurnstileHostnames []string
 	ClientIPHeader     string
+	// GAMeasurementID turns on Google Analytics 4 page measurement ("G-…").
+	// Empty means no gtag script is loaded and the CSP doesn't admit
+	// Google's hosts at all — a self-hosted demo never phones home to
+	// someone else's analytics property by default.
+	GAMeasurementID string
 }
 
 // Server is the public demo endpoint: one visitor-submitted URL in, one
@@ -71,6 +77,8 @@ type Server struct {
 	siteKey   string
 	turnstile turnstileConfig // secret "" disables Turnstile verification entirely
 	ipHeader  string          // "" means RemoteAddr only; see Options.ClientIPHeader
+	gaID      string          // "" disables analytics; see Options.GAMeasurementID
+	csp       string
 }
 
 // NewServer builds the demo server.
@@ -111,25 +119,40 @@ func NewServer(opts Options) (*Server, error) {
 		s.turnstile = turnstileConfig{secret: opts.TurnstileSecretKey, hostnames: opts.TurnstileHostnames}
 	}
 
+	if opts.GAMeasurementID != "" {
+		if !gaIDPattern.MatchString(opts.GAMeasurementID) {
+			return nil, fmt.Errorf("demo: %q is not a GA4 measurement ID (expected G-XXXXXXXXXX)", opts.GAMeasurementID)
+		}
+		s.gaID = opts.GAMeasurementID
+	}
+	s.csp = buildCSP(s.gaID != "")
+
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	mux.HandleFunc("/api/scan", s.handleScan)
-	mux.HandleFunc("/api/turnstile-sitekey", s.handleSiteKey)
+	mux.HandleFunc("/api/config", s.handleConfig)
 	s.mux = mux
 
 	return s, nil
 }
 
-// handleSiteKey exposes the PUBLIC site key only — never the secret — so the
-// frontend can render the Turnstile widget dynamically. Returns an empty
-// string when Turnstile isn't configured, and the frontend treats that as
-// "skip the widget entirely," matching the backend's own skip-when-unset
-// behavior in handleScan. The action comes from here too, so the widget and
-// verifyTurnstile can't drift apart on what the protected surface is called.
-func (s *Server) handleSiteKey(w http.ResponseWriter, r *http.Request) {
+// handleConfig hands the frontend its PUBLIC runtime config — never a
+// secret — so optional third-party scripts load only when configured:
+//   - sitekey: the Turnstile site key, or "" when Turnstile is off; the
+//     frontend then skips the widget entirely, matching handleScan's own
+//     skip-when-unset behaviour. The action comes from here too, so the
+//     widget and verifyTurnstile can't drift apart on its name.
+//   - gaMeasurementId: the GA4 ID, or "" for no analytics script at all.
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(map[string]string{"sitekey": s.siteKey, "action": turnstileAction})
+	json.NewEncoder(w).Encode(map[string]string{
+		"sitekey":         s.siteKey,
+		"action":          turnstileAction,
+		"gaMeasurementId": s.gaID,
+	})
 }
+
+var gaIDPattern = regexp.MustCompile(`^G-[A-Z0-9]{4,20}$`)
 
 func allCandidateChecks() []model.Check {
 	all := []model.Check{security.New()}
@@ -138,24 +161,36 @@ func allCandidateChecks() []model.Check {
 	return all
 }
 
-// contentSecurityPolicy is the demo page's whole policy, kept as one literal
-// so it can be read and diffed as a unit. Scripts load only from this origin
+// buildCSP returns the demo page's whole policy. Scripts load only from this origin
 // (the frontend serves /app.js rather than inlining) plus Cloudflare's
 // Turnstile; styles allow inline for the page's own <style> and Google Fonts'
 // stylesheet, with the font files from gstatic. connect-src 'self' is enough
 // because the page only calls its own /api endpoints. frame-ancestors, base-uri
 // and form-action close the clickjacking, <base>-injection and form-hijack
 // routes that default-src doesn't cover.
-const contentSecurityPolicy = "default-src 'self'; " +
-	"script-src 'self' https://challenges.cloudflare.com; " +
-	"frame-src https://challenges.cloudflare.com; " +
-	"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
-	"font-src https://fonts.gstatic.com; " +
-	"img-src 'self' data:; " +
-	"connect-src 'self'; " +
-	"frame-ancestors 'none'; " +
-	"base-uri 'none'; " +
-	"form-action 'self'"
+//
+// With analytics on, Google's GA4 hosts are added exactly where Google's CSP
+// guidance puts them (gtag.js from googletagmanager; beacons as image and
+// fetch requests to google-analytics / analytics.google.com) — and nowhere
+// when it's off.
+func buildCSP(analytics bool) string {
+	script, img, connect := "", "", ""
+	if analytics {
+		script = " https://*.googletagmanager.com"
+		img = " https://*.google-analytics.com https://*.googletagmanager.com"
+		connect = " https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com"
+	}
+	return "default-src 'self'; " +
+		"script-src 'self' https://challenges.cloudflare.com" + script + "; " +
+		"frame-src https://challenges.cloudflare.com; " +
+		"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+		"font-src https://fonts.gstatic.com; " +
+		"img-src 'self' data:" + img + "; " +
+		"connect-src 'self'" + connect + "; " +
+		"frame-ancestors 'none'; " +
+		"base-uri 'none'; " +
+		"form-action 'self'"
+}
 
 // ServeHTTP sets the security headers on EVERY response — pages, API replies,
 // errors, 404s — by setting them before dispatch rather than per handler, so a
@@ -169,7 +204,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 	h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-	h.Set("Content-Security-Policy", contentSecurityPolicy)
+	h.Set("Content-Security-Policy", s.csp)
 	s.mux.ServeHTTP(w, r)
 }
 

@@ -2,6 +2,7 @@ package demo
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -159,7 +160,7 @@ func TestServeHTTP_SecurityHeaders(t *testing.T) {
 	}
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodGet, "/"},
-		{http.MethodGet, "/api/turnstile-sitekey"},
+		{http.MethodGet, "/api/config"},
 		{http.MethodGet, "/api/scan"},     // 405
 		{http.MethodGet, "/no-such-file"}, // 404
 	} {
@@ -169,6 +170,43 @@ func TestServeHTTP_SecurityHeaders(t *testing.T) {
 			if got := rec.Header().Get(k); got != v {
 				t.Errorf("%s %s (status %d): %s = %q, want %q", tc.method, tc.path, rec.Code, k, got, v)
 			}
+		}
+	}
+}
+
+// Analytics is opt-in end to end: the ID is validated, served to the page via
+// /api/config, and only then are Google's hosts admitted by the CSP.
+func TestGAMeasurementID(t *testing.T) {
+	if _, err := NewServer(Options{GAMeasurementID: "UA-12345-1"}); err == nil {
+		t.Error("expected a non-GA4 ID to be rejected")
+	}
+
+	off, err := NewServer(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	on, err := NewServer(Options{GAMeasurementID: "G-J8KQ2CVDRG"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		srv    *Server
+		wantID string
+	}{{"off", off, ""}, {"on", on, "G-J8KQ2CVDRG"}} {
+		rec := httptest.NewRecorder()
+		tc.srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+		var cfg map[string]string
+		if err := json.NewDecoder(rec.Body).Decode(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg["gaMeasurementId"] != tc.wantID {
+			t.Errorf("%s: gaMeasurementId = %q, want %q", tc.name, cfg["gaMeasurementId"], tc.wantID)
+		}
+		csp := rec.Header().Get("Content-Security-Policy")
+		if hasGA := strings.Contains(csp, "googletagmanager.com"); hasGA != (tc.wantID != "") {
+			t.Errorf("%s: CSP admits Google hosts = %v; CSP: %s", tc.name, hasGA, csp)
 		}
 	}
 }
