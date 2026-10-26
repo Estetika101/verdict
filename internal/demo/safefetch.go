@@ -62,8 +62,26 @@ func safeFetch(ctx context.Context, rawURL string) (model.PageData, error) {
 
 	client := &http.Client{
 		Timeout: fetchTimeout,
+		// A fresh Transport is built per scan, so connection reuse buys
+		// nothing and an idle pool is pure leak: with keep-alives on and no
+		// IdleConnTimeout, every scan would leave a connection (and its
+		// goroutines) parked until the remote end closed it — forever, on
+		// a long-lived process. DisableKeepAlives closes the connection when
+		// the response body is closed.
+		//
+		// The remaining fields bound the phases the overall Client.Timeout
+		// would otherwise be the only guard for, and shut off ambient
+		// config: Proxy is nil explicitly so HTTP(S)_PROXY in the
+		// environment can never route a visitor-chosen fetch through a proxy
+		// that sits outside guardedDialContext's view (the dial guard would
+		// then be checking the proxy's IP, not the target's).
 		Transport: &http.Transport{
-			DialContext: guardedDialContext,
+			DialContext:            guardedDialContext,
+			DisableKeepAlives:      true,
+			Proxy:                  nil,
+			TLSHandshakeTimeout:    5 * time.Second,
+			ResponseHeaderTimeout:  fetchTimeout,
+			MaxResponseHeaderBytes: 64 << 10,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= maxRedirects {
@@ -144,8 +162,13 @@ func guardedDialContext(ctx context.Context, network, addr string) (net.Conn, er
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
-		// addr should already be a resolved IP:port by the time the
-		// transport dials; if it's not, resolve it ourselves and check.
+		// The transport hands DialContext the HOSTNAME:port straight from
+		// the URL — it does not pre-resolve — so this is the normal path,
+		// not a fallback. We resolve here, check the result, and then dial
+		// that exact IP (below), so the address that was validated is the
+		// address connected to; a second lookup inside the dialer could
+		// return something different (DNS rebinding). An IP-literal URL
+		// skips the lookup and is validated as-is.
 		addrs, rerr := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if rerr != nil || len(addrs) == 0 {
 			return nil, fmt.Errorf("could not resolve %s at dial time", host)
