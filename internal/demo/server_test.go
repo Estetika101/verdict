@@ -130,7 +130,7 @@ func TestHandleScan_FailedFetchFinishesRow(t *testing.T) {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 	var errText string
-	if err := store.db.QueryRow("SELECT error FROM scan_log WHERE remote_ip_hash = $1", hashIP("203.0.113.78")).Scan(&errText); err != nil {
+	if err := store.db.QueryRow("SELECT error FROM scan_log WHERE remote_ip_hash = $1", store.hashIP("203.0.113.78")).Scan(&errText); err != nil {
 		t.Fatal(err)
 	}
 	if errText == "" || errText == pendingMarker {

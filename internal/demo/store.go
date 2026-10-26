@@ -2,10 +2,12 @@ package demo
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -15,11 +17,15 @@ import (
 // operator visibility into "what's being scanned," not a user-facing feature.
 // No accounts, no per-user history: that's the real Phase 1 product, not this.
 type Store struct {
-	db *sql.DB
+	db        *sql.DB
+	ipHashKey []byte // empty means the legacy unkeyed hash; see hashIP
 }
 
-// OpenStore connects and ensures the schema exists.
-func OpenStore(ctx context.Context, connStr string) (*Store, error) {
+// OpenStore connects and ensures the schema exists. ipHashKey is the secret
+// that keys the stored IP hash (see hashIP). An empty key still works — so
+// existing self-hosted setups keep running — but falls back to the unkeyed
+// hash and logs a warning, because that hash can be reversed by brute force.
+func OpenStore(ctx context.Context, connStr, ipHashKey string) (*Store, error) {
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		return nil, fmt.Errorf("demo: open db: %w", err)
@@ -28,7 +34,10 @@ func OpenStore(ctx context.Context, connStr string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("demo: ping db: %w", err)
 	}
-	s := &Store{db: db}
+	if ipHashKey == "" {
+		log.Printf("demo: no IP hash secret set (--ip-hash-secret / $IP_HASH_SECRET) — stored IP hashes are unkeyed SHA-256 and can be reversed by brute force; set a secret")
+	}
+	s := &Store{db: db, ipHashKey: []byte(ipHashKey)}
 	if err := s.migrate(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -105,7 +114,7 @@ type ScanLogEntry struct {
 // rejected for being over the limit inserts nothing — logging every throttled
 // hit would be a cheap way to make this endpoint do more work under abuse.
 func (s *Store) Reserve(ctx context.Context, remoteIP, hostname string, window time.Duration, limit int) (id int64, allowed bool, err error) {
-	ipHash := hashIP(remoteIP)
+	ipHash := s.hashIP(remoteIP)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -152,15 +161,34 @@ WHERE id = $1`,
 	return nil
 }
 
-// hashIP truncates a SHA-256 of the client IP rather than storing it raw —
-// enough to notice "this is the same repeat visitor" without keeping a
-// plainly-identifying address around indefinitely in a log table.
-func hashIP(ip string) string {
+// hashIP pseudonymises the client IP rather than storing it raw — enough to
+// notice "this is the same repeat visitor" without keeping a plainly
+// identifying address around indefinitely in a log table.
+//
+// It is HMAC-SHA256 keyed by a server-side secret, truncated to 16 hex
+// characters. The key is the point: an unkeyed hash of an IPv4 address is not
+// anonymisation, because the whole input space is 2^32 values and anyone who
+// can read the table can hash them all in minutes and look the rows up. With a
+// secret key the table alone reveals nothing; the attacker needs the key too.
+// Truncation is kept so stored values stay short; 64 bits is ample for
+// grouping one visitor's rows.
+//
+// With no key configured it falls back to the old unkeyed SHA-256 (same
+// truncation), so a deployment that upgrades without setting a secret keeps
+// its existing rows and rate-limit history matching. Setting a key later
+// changes every hash, which resets rate-limit counters once and is otherwise
+// harmless.
+func (s *Store) hashIP(ip string) string {
 	if ip == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(ip))
-	return hex.EncodeToString(sum[:])[:16]
+	if len(s.ipHashKey) == 0 {
+		sum := sha256.Sum256([]byte(ip))
+		return hex.EncodeToString(sum[:])[:16]
+	}
+	m := hmac.New(sha256.New, s.ipHashKey)
+	m.Write([]byte(ip))
+	return hex.EncodeToString(m.Sum(nil))[:16]
 }
 
 func nullIfEmpty(s string) any {

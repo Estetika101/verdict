@@ -2,7 +2,9 @@ package demo
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -24,7 +26,7 @@ func testStore(t *testing.T) *Store {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	s, err := OpenStore(ctx, connStr)
+	s, err := OpenStore(ctx, connStr, "test-ip-hash-key")
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
@@ -140,7 +142,7 @@ func TestStore_Reserve_BlocksOnPerIPLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, hashIP(ip)); err != nil {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, s.hashIP(ip)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -241,14 +243,46 @@ func TestStore_MigrateIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	// OpenStore runs migrate() internally; opening twice must not error even
 	// though the table/index already exist (CREATE ... IF NOT EXISTS).
-	s1, err := OpenStore(ctx, connStr)
+	s1, err := OpenStore(ctx, connStr, "test-ip-hash-key")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s1.Close()
-	s2, err := OpenStore(ctx, connStr)
+	s2, err := OpenStore(ctx, connStr, "test-ip-hash-key")
 	if err != nil {
 		t.Fatalf("second OpenStore (re-migrate) failed: %v", err)
 	}
 	s2.Close()
+}
+
+// hashIP needs no database, so these run everywhere.
+func TestHashIP(t *testing.T) {
+	keyed := &Store{ipHashKey: []byte("secret-one")}
+	keyed2 := &Store{ipHashKey: []byte("secret-two")}
+	unkeyed := &Store{}
+
+	if a, b := keyed.hashIP("203.0.113.5"), keyed.hashIP("203.0.113.5"); a != b {
+		t.Errorf("hash is not deterministic: %q vs %q", a, b)
+	}
+	if keyed.hashIP("203.0.113.5") == keyed.hashIP("203.0.113.6") {
+		t.Error("different IPs must hash differently")
+	}
+	if keyed.hashIP("203.0.113.5") == keyed2.hashIP("203.0.113.5") {
+		t.Error("different keys must produce different hashes")
+	}
+	if keyed.hashIP("203.0.113.5") == unkeyed.hashIP("203.0.113.5") {
+		t.Error("keyed hash must differ from the unkeyed hash, or the key does nothing")
+	}
+	if got := len(keyed.hashIP("203.0.113.5")); got != 16 {
+		t.Errorf("hash length = %d, want 16", got)
+	}
+	// The fallback must stay byte-compatible with the pre-key hash, so
+	// upgrading without a secret keeps existing rows matching.
+	sum := sha256.Sum256([]byte("203.0.113.5"))
+	if got, want := unkeyed.hashIP("203.0.113.5"), hex.EncodeToString(sum[:])[:16]; got != want {
+		t.Errorf("unkeyed fallback = %q, want legacy SHA-256 prefix %q", got, want)
+	}
+	if keyed.hashIP("") != "" || unkeyed.hashIP("") != "" {
+		t.Error("empty IP must hash to the empty string")
+	}
 }

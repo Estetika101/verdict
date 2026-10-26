@@ -25,7 +25,7 @@ func main() {
 	var store *demo.Store
 	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		s, err := demo.OpenStore(ctx, dbURL)
+		s, err := demo.OpenStore(ctx, dbURL, os.Getenv("IP_HASH_SECRET"))
 		cancel()
 		if err != nil {
 			// Fail open, not closed: a demo endpoint without logging/rate

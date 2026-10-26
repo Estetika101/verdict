@@ -55,7 +55,10 @@ just a flag on it:
   does can trigger a second network call.
 - **Rate-limited** (5 scans/hour/IP by default) and **optionally logs to
   Postgres** (`--database-url`, or `$DATABASE_URL`; a hashed IP, hostname, and
-  finding counts only — no scraped content, no plaintext IP) purely for
+  finding counts only — no scraped content, no plaintext IP; the IP hash
+  is HMAC-SHA256 keyed by `--ip-hash-secret` / `$IP_HASH_SECRET`, because an
+  unkeyed hash of an IPv4 address can be brute-forced in minutes — leave the
+  secret unset and it falls back to the unkeyed hash with a startup warning) purely for
   operator visibility into what's being scanned. Logging is disabled, not
   fatal, if no database is configured. Rate limiting is a reservation against
   that same log table: one transaction, serialised per IP by a Postgres
@@ -84,6 +87,7 @@ just a flag on it:
 ```sh
 verdict demo --port 8080 \
   --database-url "postgres://…" \
+  --ip-hash-secret "<long random string, kept stable>" \
   --client-ip-header "Fly-Client-IP" \
   --turnstile-sitekey "0x4..." --turnstile-secret "0x4..."
 ```
@@ -97,7 +101,8 @@ self-host path (Fly, a VPS, any container host).
 `cmd/server/main.go` is a second, minimal entrypoint that builds the exact
 same `internal/demo.Server` from environment variables instead of flags
 (`DATABASE_URL`, `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, `PORT`,
-`CLIENT_IP_HEADER`, which defaults to `X-Real-IP` there) —
+`CLIENT_IP_HEADER`, which defaults to `X-Real-IP` there, and
+`IP_HASH_SECRET`) —
 Vercel's Go Framework Preset auto-detects it, so `vercel.json` only needs
 `"framework": "go"`. Point `DATABASE_URL` at Neon and it's the same
 Postgres-backed logging/rate-limiting as the self-hosted command, just on a
