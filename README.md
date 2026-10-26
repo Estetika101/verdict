@@ -70,10 +70,18 @@ just a flag on it:
   `/api/turnstile-sitekey` and only injects Cloudflare's script if a key comes
   back), so a deploy without Turnstile configured behaves exactly as if this
   feature didn't exist.
+- **Client IP comes from one trusted header, or none.** By default the rate
+  limiter keys on the connection's address only. Behind a proxy, set
+  `--client-ip-header` (or `$CLIENT_IP_HEADER`) to the single header your edge
+  overwrites on every request: `Fly-Client-IP` on Fly, `X-Real-IP` on Vercel,
+  empty when exposed directly. Any other header is ignored, because trusting
+  one the platform doesn't overwrite lets a visitor pick a fresh rate-limit
+  key per request.
 
 ```sh
 verdict demo --port 8080 \
   --database-url "postgres://…" \
+  --client-ip-header "Fly-Client-IP" \
   --turnstile-sitekey "0x4..." --turnstile-secret "0x4..."
 ```
 
@@ -85,7 +93,8 @@ self-host path (Fly, a VPS, any container host).
 **Deploying to Vercel** is the other option, and needs no separate Dockerfile:
 `cmd/server/main.go` is a second, minimal entrypoint that builds the exact
 same `internal/demo.Server` from environment variables instead of flags
-(`DATABASE_URL`, `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, `PORT`) —
+(`DATABASE_URL`, `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, `PORT`,
+`CLIENT_IP_HEADER`, which defaults to `X-Real-IP` there) —
 Vercel's Go Framework Preset auto-detects it, so `vercel.json` only needs
 `"framework": "go"`. Point `DATABASE_URL` at Neon and it's the same
 Postgres-backed logging/rate-limiting as the self-hosted command, just on a

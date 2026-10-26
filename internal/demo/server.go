@@ -38,6 +38,14 @@ const (
 // browser) and the secret key (private, used server-side) are set — a site
 // key alone would render a widget nothing actually checks.
 //
+// ClientIPHeader names the ONE request header to trust for the visitor's IP.
+// Empty (the default) means trust nothing but the connection's RemoteAddr,
+// which is correct when the server is exposed directly. Set it only to a
+// header your edge proxy overwrites on every request — "Fly-Client-IP" on
+// Fly, "X-Real-IP" on Vercel. Trusting a header the platform does NOT
+// overwrite lets any visitor mint a fresh rate-limit key per request by
+// sending their own value, which silently turns rate limiting off.
+//
 // Rate limiting requires Store: it's implemented as a count query against the
 // same log table LogScan writes to (see store.go's CountRecent doc comment
 // for why this replaced an earlier in-memory version). Running the demo
@@ -47,6 +55,7 @@ type Options struct {
 	Store              *Store
 	TurnstileSiteKey   string
 	TurnstileSecretKey string
+	ClientIPHeader     string
 }
 
 // Server is the public demo endpoint: one visitor-submitted URL in, one
@@ -57,6 +66,7 @@ type Server struct {
 	mux       *http.ServeMux
 	siteKey   string
 	secretKey string // "" disables Turnstile verification entirely
+	ipHeader  string // "" means RemoteAddr only; see Options.ClientIPHeader
 }
 
 // NewServer builds the demo server.
@@ -81,8 +91,9 @@ func NewServer(opts Options) (*Server, error) {
 	}
 
 	s := &Server{
-		store:  opts.Store,
-		checks: pageChecks,
+		store:    opts.Store,
+		checks:   pageChecks,
+		ipHeader: opts.ClientIPHeader,
 	}
 	// Both keys required, or neither counts — see the Options doc comment.
 	if opts.TurnstileSiteKey != "" && opts.TurnstileSecretKey != "" {
@@ -128,7 +139,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := clientIP(r)
+	ip := clientIP(r, s.ipHeader)
 	ctx, cancel := context.WithTimeout(r.Context(), scanTimeout)
 	defer cancel()
 
@@ -253,19 +264,27 @@ func (c *demoCheckContext) Fetch(context.Context, string) (model.PageData, error
 	return model.PageData{}, errors.New("fetch is not available in the public demo — only the submitted page itself is checked")
 }
 
-// clientIP prefers Fly.io's client-IP header (set by their edge proxy, so
-// RemoteAddr would otherwise just be the internal proxy hop) and falls back
-// to RemoteAddr for local/direct runs. RemoteAddr is host:port — the port is
-// a fresh ephemeral value on every connection, so it MUST be stripped or the
-// rate limiter silently never sees a repeat key (caught live: curling the
-// same "attacker" six times in a row from one machine all landed as distinct
-// keys and every request sailed through).
-func clientIP(r *http.Request) string {
-	if v := r.Header.Get("Fly-Client-IP"); v != "" {
-		return v
-	}
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		return strings.TrimSpace(strings.Split(v, ",")[0])
+// clientIP returns the visitor's address for rate limiting and Turnstile.
+//
+// With header empty it uses RemoteAddr alone. With header set it reads that
+// one header (first comma-separated field, trimmed) and falls back to
+// RemoteAddr when the header is absent or blank. Only the single configured
+// header is ever consulted: honouring a fixed list (Fly-Client-IP, then
+// X-Forwarded-For) means a visitor on a platform that sets a different header
+// can send their own value for the other and pick their own rate-limit key.
+//
+// RemoteAddr is host:port — the port is a fresh ephemeral value on every
+// connection, so it MUST be stripped or the rate limiter silently never sees
+// a repeat key (caught live: curling the same "attacker" six times in a row
+// from one machine all landed as distinct keys and every request sailed
+// through).
+func clientIP(r *http.Request, header string) string {
+	if header != "" {
+		if v := r.Header.Get(header); v != "" {
+			if first := strings.TrimSpace(strings.Split(v, ",")[0]); first != "" {
+				return first
+			}
+		}
 	}
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host

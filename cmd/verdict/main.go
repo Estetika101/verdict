@@ -57,6 +57,7 @@ func runDemo(args []string, stdout, stderr *os.File) int {
 	dbURL := fs.String("database-url", os.Getenv("DATABASE_URL"), "Postgres connection string for scan logging (optional; defaults to $DATABASE_URL, logging disabled if empty)")
 	turnstileSiteKey := fs.String("turnstile-sitekey", os.Getenv("TURNSTILE_SITE_KEY"), "Cloudflare Turnstile site key (public; defaults to $TURNSTILE_SITE_KEY)")
 	turnstileSecretKey := fs.String("turnstile-secret", os.Getenv("TURNSTILE_SECRET_KEY"), "Cloudflare Turnstile secret key (private; defaults to $TURNSTILE_SECRET_KEY; verification is skipped entirely if either key is empty)")
+	clientIPHeader := fs.String("client-ip-header", os.Getenv("CLIENT_IP_HEADER"), "request header carrying the visitor's IP, trusted for rate limiting (defaults to $CLIENT_IP_HEADER): \"Fly-Client-IP\" on Fly, \"X-Real-IP\" on Vercel, empty when exposed directly (uses the connection address)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -87,6 +88,7 @@ func runDemo(args []string, stdout, stderr *os.File) int {
 		Store:              store,
 		TurnstileSiteKey:   *turnstileSiteKey,
 		TurnstileSecretKey: *turnstileSecretKey,
+		ClientIPHeader:     *clientIPHeader,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, err)

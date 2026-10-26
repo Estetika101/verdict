@@ -13,7 +13,7 @@ import (
 func TestClientIP_StripsPortFromRemoteAddr(t *testing.T) {
 	r1 := &http.Request{RemoteAddr: "203.0.113.5:51234", Header: http.Header{}}
 	r2 := &http.Request{RemoteAddr: "203.0.113.5:60000", Header: http.Header{}}
-	ip1, ip2 := clientIP(r1), clientIP(r2)
+	ip1, ip2 := clientIP(r1, ""), clientIP(r2, "")
 	if ip1 != ip2 {
 		t.Fatalf("clientIP should ignore ephemeral port so repeat requests share a key: got %q and %q", ip1, ip2)
 	}
@@ -22,23 +22,43 @@ func TestClientIP_StripsPortFromRemoteAddr(t *testing.T) {
 	}
 }
 
-func TestClientIP_PrefersFlyHeader(t *testing.T) {
-	r := &http.Request{
-		RemoteAddr: "10.0.0.1:1234", // Fly's internal proxy hop
-		Header:     http.Header{"Fly-Client-Ip": []string{"198.51.100.7"}},
+func TestClientIP_UsesConfiguredHeader(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+		set    http.Header
+		remote string
+		want   string
+	}{
+		{"fly header", "Fly-Client-IP", http.Header{"Fly-Client-Ip": {"198.51.100.7"}}, "10.0.0.1:1234", "198.51.100.7"},
+		{"first of comma list, trimmed", "X-Real-IP", http.Header{"X-Real-Ip": {" 198.51.100.7 , 10.0.0.2"}}, "10.0.0.1:1234", "198.51.100.7"},
+		{"configured header absent falls back to RemoteAddr", "X-Real-IP", http.Header{}, "203.0.113.5:4000", "203.0.113.5"},
+		{"configured header blank falls back to RemoteAddr", "X-Real-IP", http.Header{"X-Real-Ip": {"  "}}, "203.0.113.5:4000", "203.0.113.5"},
 	}
-	if got := clientIP(r); got != "198.51.100.7" {
-		t.Errorf("clientIP = %q, want the Fly-Client-IP value", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &http.Request{RemoteAddr: tc.remote, Header: tc.set}
+			if got := clientIP(r, tc.header); got != tc.want {
+				t.Errorf("clientIP = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
-func TestClientIP_FallsBackToXForwardedFor(t *testing.T) {
-	r := &http.Request{
-		RemoteAddr: "10.0.0.1:1234",
-		Header:     http.Header{"X-Forwarded-For": []string{"198.51.100.7, 10.0.0.2"}},
+// Regression: on a platform that doesn't overwrite Fly-Client-IP (Vercel), a
+// visitor could send their own and get a fresh rate-limit key per request.
+// A client-supplied header must be ignored unless it is THE configured one.
+func TestClientIP_IgnoresSpoofedHeaders(t *testing.T) {
+	spoofed := http.Header{
+		"Fly-Client-Ip":   {"192.0.2.99"},
+		"X-Forwarded-For": {"192.0.2.98"},
+		"X-Real-Ip":       {"192.0.2.97"},
 	}
-	if got := clientIP(r); got != "198.51.100.7" {
-		t.Errorf("clientIP = %q, want the first X-Forwarded-For entry", got)
+	for _, header := range []string{"", "Some-Other-Header"} {
+		r := &http.Request{RemoteAddr: "203.0.113.5:4000", Header: spoofed}
+		if got := clientIP(r, header); got != "203.0.113.5" {
+			t.Errorf("header option %q: clientIP = %q, want RemoteAddr 203.0.113.5 (spoofed headers must be ignored)", header, got)
+		}
 	}
 }
 

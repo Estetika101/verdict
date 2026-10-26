@@ -38,10 +38,20 @@ func main() {
 		}
 	}
 
+	// Vercel overwrites X-Real-IP (and X-Forwarded-For) at its edge, so a
+	// visitor can't spoof either; Fly-Client-IP is NOT overwritten there and
+	// must not be trusted. Override only if you front this with something
+	// else that sets a different header.
+	clientIPHeader := os.Getenv("CLIENT_IP_HEADER")
+	if clientIPHeader == "" {
+		clientIPHeader = "X-Real-IP"
+	}
+
 	srv, err := demo.NewServer(demo.Options{
 		Store:              store,
 		TurnstileSiteKey:   os.Getenv("TURNSTILE_SITE_KEY"),
 		TurnstileSecretKey: os.Getenv("TURNSTILE_SECRET_KEY"),
+		ClientIPHeader:     clientIPHeader,
 	})
 	if err != nil {
 		log.Fatalf("server: %v", err)
