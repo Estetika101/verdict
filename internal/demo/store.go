@@ -55,8 +55,8 @@ CREATE TABLE IF NOT EXISTS scan_log (
 	if err != nil {
 		return fmt.Errorf("demo: migrate: %w", err)
 	}
-	// CountRecent runs on every request now (it's the rate-limit check), so
-	// this index is load-bearing for latency, not just a nice-to-have.
+	// Reserve counts by (ip hash, time) on every request, so this index is
+	// load-bearing for latency, not just a nice-to-have.
 	_, err = s.db.ExecContext(ctx, `
 CREATE INDEX IF NOT EXISTS scan_log_ip_time_idx ON scan_log (remote_ip_hash, requested_at)`)
 	if err != nil {
@@ -65,51 +65,91 @@ CREATE INDEX IF NOT EXISTS scan_log_ip_time_idx ON scan_log (remote_ip_hash, req
 	return nil
 }
 
-// ScanLogEntry is one row: either a successful scan (counts populated, Err
-// empty) or a failed/rejected attempt (Err populated) — both are useful
-// signal for "what's being scanned," including abuse attempts. ErrorCount and
-// WarnCount are the two severities within status:fail, computed by the
-// caller from the findings themselves — model.Summary only has one coarse
-// "Fail" bucket, which would misrepresent "9 warnings, 1 real error" as
-// "10 failed" in the log the same way it briefly did in the dashboard.
+// pendingMarker is the error value a reserved row carries between Reserve and
+// Finish. A row stuck on it (the process died mid-scan) still counts toward
+// the visitor's limit, which is the right outcome — and is itself a useful
+// operator signal that a scan never completed.
+const pendingMarker = "pending"
+
+// ScanLogEntry is the outcome Finish writes onto a reserved row: either a
+// successful scan (counts populated, Err empty) or a failed/rejected attempt
+// (Err populated) — both are useful signal for "what's being scanned,"
+// including abuse attempts. ErrorCount and WarnCount are the two severities
+// within status:fail, computed by the caller from the findings themselves —
+// model.Summary only has one coarse "Fail" bucket, which would misrepresent
+// "9 warnings, 1 real error" as "10 failed" in the log the same way it
+// briefly did in the dashboard.
 type ScanLogEntry struct {
-	Hostname                                               string
-	RemoteIP                                               string
 	ErrorCount, WarnCount, PassCount, SkipCount, InfoCount int
 	Err                                                    string
 }
 
-// LogScan records one entry. Errors are the caller's to decide whether to
-// surface — logging failure should never block the actual scan response.
-func (s *Store) LogScan(ctx context.Context, e ScanLogEntry) error {
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO scan_log (hostname, error_count, warn_count, pass_count, skip_count, info_count, remote_ip_hash, error)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-		e.Hostname, e.ErrorCount, e.WarnCount, e.PassCount, e.SkipCount, e.InfoCount, hashIP(e.RemoteIP), nullIfEmpty(e.Err))
+// Reserve is the rate limiter: it atomically decides whether remoteIP may
+// start another scan and, if so, claims the slot by inserting the row the scan
+// will later fill in via Finish.
+//
+// Count-then-scan-then-log was a race: a scan takes seconds, so N concurrent
+// requests all read the same count, all passed, and all logged afterwards —
+// the limit bounded sequential traffic only. Here the check and the claim are
+// one transaction, serialised per visitor by a transaction-scoped advisory
+// lock on the IP hash: a second request for the same IP blocks on the lock
+// until the first commits, then sees its row and counts it. Different IPs hash
+// to different lock keys and never wait on each other (a hash collision just
+// serialises two visitors briefly; it can't mis-count, since the count is by
+// the hash column, not the lock). The lock releases on commit or rollback, so
+// it can't leak. Postgres-backed rather than in-memory for the same reason as
+// before: correct on any elastic/serverless host where successive requests
+// don't share a process.
+//
+// Reserved rows count whether or not the scan later succeeds, and a request
+// rejected for being over the limit inserts nothing — logging every throttled
+// hit would be a cheap way to make this endpoint do more work under abuse.
+func (s *Store) Reserve(ctx context.Context, remoteIP, hostname string, window time.Duration, limit int) (id int64, allowed bool, err error) {
+	ipHash := hashIP(remoteIP)
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("demo: log scan: %w", err)
+		return 0, false, fmt.Errorf("demo: reserve: begin: %w", err)
 	}
-	return nil
+	defer tx.Rollback() // no-op after Commit
+
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, ipHash); err != nil {
+		return 0, false, fmt.Errorf("demo: reserve: lock: %w", err)
+	}
+	var n int
+	if err := tx.QueryRowContext(ctx, `
+SELECT count(*) FROM scan_log WHERE remote_ip_hash = $1 AND requested_at > $2`,
+		ipHash, time.Now().Add(-window)).Scan(&n); err != nil {
+		return 0, false, fmt.Errorf("demo: reserve: count: %w", err)
+	}
+	if n >= limit {
+		return 0, false, nil // deferred Rollback releases the lock
+	}
+	if err := tx.QueryRowContext(ctx, `
+INSERT INTO scan_log (hostname, remote_ip_hash, error) VALUES ($1, $2, $3) RETURNING id`,
+		hostname, ipHash, pendingMarker).Scan(&id); err != nil {
+		return 0, false, fmt.Errorf("demo: reserve: insert: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, fmt.Errorf("demo: reserve: commit: %w", err)
+	}
+	return id, true, nil
 }
 
-// CountRecent returns how many scan attempts (successful or not, but never
-// requests that were themselves rejected purely for being rate-limited — see
-// the caller) this IP has made within window, ending now. This is the actual
-// rate-limit mechanism: reading the same table LogScan writes to, rather than
-// an in-process map, is what makes rate limiting correct regardless of
-// whether the deployment target guarantees a given visitor's requests land on
-// the same warm process twice — an in-memory counter would silently stop
-// working the moment that assumption breaks (serverless scale-out, multiple
-// Fly instances, anything elastic).
-func (s *Store) CountRecent(ctx context.Context, remoteIP string, window time.Duration) (int, error) {
-	var n int
-	err := s.db.QueryRowContext(ctx, `
-SELECT count(*) FROM scan_log WHERE remote_ip_hash = $1 AND requested_at > $2`,
-		hashIP(remoteIP), time.Now().Add(-window)).Scan(&n)
+// Finish writes a scan's outcome onto the row Reserve created, replacing the
+// pending marker: the error column is NULL on success and the failure reason
+// otherwise. Errors are the caller's to decide whether to surface — a logging
+// failure should never block the actual scan response.
+func (s *Store) Finish(ctx context.Context, id int64, e ScanLogEntry) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE scan_log
+SET error_count = $2, warn_count = $3, pass_count = $4, skip_count = $5, info_count = $6, error = $7
+WHERE id = $1`,
+		id, e.ErrorCount, e.WarnCount, e.PassCount, e.SkipCount, e.InfoCount, nullIfEmpty(e.Err))
 	if err != nil {
-		return 0, fmt.Errorf("demo: count recent: %w", err)
+		return fmt.Errorf("demo: finish scan: %w", err)
 	}
-	return n, nil
+	return nil
 }
 
 // hashIP truncates a SHA-256 of the client IP rather than storing it raw —

@@ -57,8 +57,11 @@ just a flag on it:
   Postgres** (`--database-url`, or `$DATABASE_URL`; a hashed IP, hostname, and
   finding counts only — no scraped content, no plaintext IP) purely for
   operator visibility into what's being scanned. Logging is disabled, not
-  fatal, if no database is configured. Rate limiting is a `COUNT` query
-  against that same log table, deliberately not an in-memory counter — an
+  fatal, if no database is configured. Rate limiting is a reservation against
+  that same log table: one transaction, serialised per IP by a Postgres
+  advisory lock, counts the visitor's recent rows and claims a slot before the
+  scan starts (so concurrent requests can't all slip under the limit). It is
+  deliberately not an in-memory counter — an
   in-process map can't guarantee a given visitor's requests land on the same
   warm instance on any elastic/serverless host, so it would silently stop
   limiting anything the moment that assumption breaks. This also means rate

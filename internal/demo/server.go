@@ -46,11 +46,11 @@ const (
 // overwrite lets any visitor mint a fresh rate-limit key per request by
 // sending their own value, which silently turns rate limiting off.
 //
-// Rate limiting requires Store: it's implemented as a count query against the
-// same log table LogScan writes to (see store.go's CountRecent doc comment
-// for why this replaced an earlier in-memory version). Running the demo
-// without a database means running it without rate limiting — acceptable for
-// local development, not for a public deployment.
+// Rate limiting requires Store: it's implemented as a reservation against the
+// same log table the scan is recorded in (see store.go's Reserve doc comment
+// for why this replaced an in-memory version). Running the demo without a
+// database means running it without rate limiting — acceptable for local
+// development, not for a public deployment.
 type Options struct {
 	Store              *Store
 	TurnstileSiteKey   string
@@ -143,24 +143,6 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), scanTimeout)
 	defer cancel()
 
-	// Rate limiting reads the same log table LogScan writes to (see
-	// CountRecent's doc comment) — correct regardless of whether this process
-	// is the same one that handled this visitor's last request, which an
-	// in-memory counter could not guarantee on any elastic/serverless host.
-	// A rejected-for-rate-limit attempt is deliberately NOT logged: it adds
-	// no new information (the count that triggered the rejection is already
-	// in the table) and logging every throttled hit would itself be a cheap
-	// way to make this endpoint do more work under abuse, not less.
-	if s.store != nil {
-		n, err := s.store.CountRecent(ctx, ip, rateLimitWindow)
-		if err != nil {
-			log.Printf("demo: rate limit check failed, allowing request: %v", err)
-		} else if n >= scansPerHour {
-			http.Error(w, fmt.Sprintf("rate limit exceeded — max %d scans/hour, try again later", scansPerHour), http.StatusTooManyRequests)
-			return
-		}
-	}
-
 	var body struct {
 		URL            string `json:"url"`
 		TurnstileToken string `json:"turnstileToken"`
@@ -175,17 +157,45 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Rate limiting is a reservation, taken BEFORE the slow work, not a count
+	// taken before and a log written after (see Store.Reserve for the race
+	// that replaced). It runs after the body is parsed so malformed requests
+	// don't burn a slot, and before Turnstile and the fetch so a visitor over
+	// the limit costs us one small query and nothing else. A rejected-for-
+	// rate-limit attempt is deliberately NOT logged: it adds no new
+	// information (the rows that triggered the rejection are already in the
+	// table) and logging every throttled hit would itself be a cheap way to
+	// make this endpoint do more work under abuse, not less.
+	var scanID int64
+	if s.store != nil {
+		id, allowed, err := s.store.Reserve(ctx, ip, hostnameOf(target), rateLimitWindow, scansPerHour)
+		switch {
+		case err != nil:
+			// Fail open: a database hiccup shouldn't take the demo down. With
+			// no reserved row there is nothing to Finish (scanID stays 0).
+			log.Printf("demo: rate limit reservation failed, allowing request: %v", err)
+		case !allowed:
+			http.Error(w, fmt.Sprintf("rate limit exceeded — max %d scans/hour, try again later", scansPerHour), http.StatusTooManyRequests)
+			return
+		default:
+			scanID = id
+		}
+	}
+
 	// Turnstile verification only runs when a secret key is configured
 	// (see Options' doc comment) — local/dev runs without one work exactly
 	// as before. A verification failure is reported to the visitor as
-	// exactly that, not folded into the generic scan-failure path.
+	// exactly that, not folded into the generic scan-failure path. It still
+	// finishes the reserved row, so the log shows why it never scanned.
 	if s.secretKey != "" {
 		human, verr := verifyTurnstile(ctx, s.secretKey, body.TurnstileToken, ip)
 		if verr != nil {
+			s.finishScan(ctx, scanID, ScanLogEntry{Err: "turnstile verification unavailable: " + verr.Error()})
 			http.Error(w, "verification check failed — please try again", http.StatusBadGateway)
 			return
 		}
 		if !human {
+			s.finishScan(ctx, scanID, ScanLogEntry{Err: "turnstile verification failed"})
 			http.Error(w, "please complete the human verification and try again", http.StatusForbidden)
 			return
 		}
@@ -193,7 +203,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 
 	pd, err := safeFetch(ctx, target)
 	if err != nil {
-		s.logScan(ctx, ScanLogEntry{Hostname: hostnameOf(target), RemoteIP: ip, Err: err.Error()})
+		s.finishScan(ctx, scanID, ScanLogEntry{Err: err.Error()})
 		http.Error(w, "could not scan that URL: "+userFacingError(err), http.StatusBadRequest)
 		return
 	}
@@ -211,8 +221,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	engine.SortFindings(findings)
 	summary := model.Summarize(findings)
 
-	s.logScan(ctx, ScanLogEntry{
-		Hostname: hostnameOf(target), RemoteIP: ip,
+	s.finishScan(ctx, scanID, ScanLogEntry{
 		ErrorCount: countBySeverity(findings, model.SeverityError),
 		WarnCount:  countBySeverity(findings, model.SeverityWarn),
 		PassCount:  summary.Pass, SkipCount: summary.Skipped, InfoCount: summary.Info,
@@ -226,24 +235,30 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// logScan is synchronous, deliberately not a fire-and-forget goroutine: on
+// finishScan is synchronous, deliberately not a fire-and-forget goroutine: on
 // any host that can freeze or tear down a process/instance immediately after
 // a response is sent (which includes serverless platforms, but is not
 // guaranteed to exclude a persistent host either during a deploy or restart),
 // a detached goroutine racing that teardown can simply never complete,
-// silently losing the log entry. A synchronous call with a bounded timeout
-// costs a little latency but guarantees the write is at least attempted
-// before the handler returns. A logging failure still never fails the
-// visitor's actual request — it's just written to stderr instead of the log
-// table.
-func (s *Server) logScan(ctx context.Context, e ScanLogEntry) {
-	if s.store == nil {
+// silently leaving the row on "pending". A synchronous call with a bounded
+// timeout costs a little latency but guarantees the write is at least
+// attempted before the handler returns. A logging failure still never fails
+// the visitor's actual request — it's just written to stderr instead of the
+// log table.
+//
+// The write runs on a context detached from ctx's cancellation: the scan
+// context carries the 15s scan deadline, and a scan that timed out is exactly
+// the outcome most worth recording — deriving from the expired ctx would fail
+// the write instead. id 0 means no row was reserved (no store, or the
+// reservation failed open), so there is nothing to finish.
+func (s *Server) finishScan(ctx context.Context, id int64, e ScanLogEntry) {
+	if s.store == nil || id == 0 {
 		return
 	}
-	logCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
-	if err := s.store.LogScan(logCtx, e); err != nil {
-		log.Printf("demo: log scan failed: %v", err)
+	if err := s.store.Finish(logCtx, id, e); err != nil {
+		log.Printf("demo: finish scan failed: %v", err)
 	}
 }
 

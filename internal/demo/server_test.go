@@ -1,8 +1,12 @@
 package demo
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 // Regression: RemoteAddr's ephemeral port must be stripped, or the rate
@@ -84,5 +88,52 @@ func TestNormalizeSubmittedURL(t *testing.T) {
 		if ok && got != tc.want {
 			t.Errorf("normalizeSubmittedURL(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// End to end through the handler: once an IP has used its budget, the next
+// POST is a 429 — before any Turnstile or network work happens (the target
+// below would be rejected as private if the fetch were reached).
+func TestHandleScan_RateLimited(t *testing.T) {
+	store := testStore(t)
+	srv, err := NewServer(Options{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < scansPerHour; i++ {
+		if _, ok, err := store.Reserve(context.Background(), "203.0.113.77", "example.com", time.Hour, scansPerHour); err != nil || !ok {
+			t.Fatalf("setup Reserve #%d = (%v, %v)", i+1, ok, err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/scan", strings.NewReader(`{"url":"http://127.0.0.1/"}`))
+	req.RemoteAddr = "203.0.113.77:5555"
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", rec.Code)
+	}
+}
+
+// A fetch that fails (here: a private target) must still finish the reserved
+// row with the failure reason instead of leaving it "pending".
+func TestHandleScan_FailedFetchFinishesRow(t *testing.T) {
+	store := testStore(t)
+	srv, err := NewServer(Options{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/scan", strings.NewReader(`{"url":"http://127.0.0.1:1/"}`))
+	req.RemoteAddr = "203.0.113.78:5555"
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	var errText string
+	if err := store.db.QueryRow("SELECT error FROM scan_log WHERE remote_ip_hash = $1", hashIP("203.0.113.78")).Scan(&errText); err != nil {
+		t.Fatal(err)
+	}
+	if errText == "" || errText == pendingMarker {
+		t.Errorf("row error = %q, want the fetch failure reason", errText)
 	}
 }
