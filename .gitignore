@@ -18,3 +18,4 @@ coverage.*
 # OS / editor
 .DS_Store
 *.swp
+.vercel
