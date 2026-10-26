@@ -51,6 +51,7 @@ func main() {
 		Store:              store,
 		TurnstileSiteKey:   os.Getenv("TURNSTILE_SITE_KEY"),
 		TurnstileSecretKey: os.Getenv("TURNSTILE_SECRET_KEY"),
+		TurnstileHostnames: demo.ParseHostnames(os.Getenv("TURNSTILE_HOSTNAMES")),
 		ClientIPHeader:     clientIPHeader,
 	})
 	if err != nil {

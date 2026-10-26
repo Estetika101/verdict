@@ -330,6 +330,7 @@
       script.onload = function () {
         turnstile.widget = window.turnstile.render('#turnstileWidget', {
           sitekey: data.sitekey,
+          action: data.action,
           theme: 'dark',
           callback: function (token) { turnstile.token = token; },
           'expired-callback': function () { turnstile.token = ''; },

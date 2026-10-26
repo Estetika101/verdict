@@ -75,7 +75,13 @@ just a flag on it:
   nothing actually checks. The widget loads dynamically (the frontend fetches
   `/api/turnstile-sitekey` and only injects Cloudflare's script if a key comes
   back), so a deploy without Turnstile configured behaves exactly as if this
-  feature didn't exist.
+  feature didn't exist. With Turnstile on, `--turnstile-hostnames` /
+  `$TURNSTILE_HOSTNAMES` (comma-separated, this demo's own domain) is
+  required: a token only verifies if Cloudflare reports it was solved for the
+  `scan` action on an allowed hostname, so a token minted on another site
+  sharing the key is refused. The server won't start with keys but no
+  hostnames. Malformed tokens (empty, over 2048 chars) are rejected before
+  calling Cloudflare, and the verify call has its own 10s timeout.
 - **Security headers on every response**: a strict Content-Security-Policy
   (scripts from this origin and Cloudflare Turnstile only), `nosniff`,
   `X-Frame-Options: DENY`, HSTS, a restrictive Referrer-Policy and
@@ -93,7 +99,8 @@ verdict demo --port 8080 \
   --database-url "postgres://…" \
   --ip-hash-secret "<long random string, kept stable>" \
   --client-ip-header "Fly-Client-IP" \
-  --turnstile-sitekey "0x4..." --turnstile-secret "0x4..."
+  --turnstile-sitekey "0x4..." --turnstile-secret "0x4..." \
+  --turnstile-hostnames "demo.example.com"
 ```
 
 `Dockerfile.demo` builds a dedicated image for this — deliberately separate

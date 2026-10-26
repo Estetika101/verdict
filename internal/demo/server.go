@@ -36,7 +36,10 @@ const (
 // without logging/rate-limiting and without human verification (e.g. local
 // dev). Turnstile is on only when BOTH the site key (public, sent to the
 // browser) and the secret key (private, used server-side) are set — a site
-// key alone would render a widget nothing actually checks.
+// key alone would render a widget nothing actually checks. With both set,
+// TurnstileHostnames is required too: the allowlist of hostnames a token may
+// have been solved on (this demo's own domain), so a token minted on another
+// site using the same key isn't honoured here.
 //
 // ClientIPHeader names the ONE request header to trust for the visitor's IP.
 // Empty (the default) means trust nothing but the connection's RemoteAddr,
@@ -55,6 +58,7 @@ type Options struct {
 	Store              *Store
 	TurnstileSiteKey   string
 	TurnstileSecretKey string
+	TurnstileHostnames []string
 	ClientIPHeader     string
 }
 
@@ -65,8 +69,8 @@ type Server struct {
 	checks    []model.Check
 	mux       *http.ServeMux
 	siteKey   string
-	secretKey string // "" disables Turnstile verification entirely
-	ipHeader  string // "" means RemoteAddr only; see Options.ClientIPHeader
+	turnstile turnstileConfig // secret "" disables Turnstile verification entirely
+	ipHeader  string          // "" means RemoteAddr only; see Options.ClientIPHeader
 }
 
 // NewServer builds the demo server.
@@ -97,8 +101,14 @@ func NewServer(opts Options) (*Server, error) {
 	}
 	// Both keys required, or neither counts — see the Options doc comment.
 	if opts.TurnstileSiteKey != "" && opts.TurnstileSecretKey != "" {
+		// Refuse to start rather than run a widget whose tokens could never
+		// verify (or, worse, would verify from any site): a misconfigured
+		// deploy should fail loudly at boot, not reject every visitor quietly.
+		if len(opts.TurnstileHostnames) == 0 {
+			return nil, errors.New("demo: Turnstile is configured but no hostnames are allowed — set TURNSTILE_HOSTNAMES / --turnstile-hostnames to this demo's domain")
+		}
 		s.siteKey = opts.TurnstileSiteKey
-		s.secretKey = opts.TurnstileSecretKey
+		s.turnstile = turnstileConfig{secret: opts.TurnstileSecretKey, hostnames: opts.TurnstileHostnames}
 	}
 
 	mux := http.NewServeMux()
@@ -114,10 +124,11 @@ func NewServer(opts Options) (*Server, error) {
 // frontend can render the Turnstile widget dynamically. Returns an empty
 // string when Turnstile isn't configured, and the frontend treats that as
 // "skip the widget entirely," matching the backend's own skip-when-unset
-// behavior in handleScan.
+// behavior in handleScan. The action comes from here too, so the widget and
+// verifyTurnstile can't drift apart on what the protected surface is called.
 func (s *Server) handleSiteKey(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(map[string]string{"sitekey": s.siteKey})
+	json.NewEncoder(w).Encode(map[string]string{"sitekey": s.siteKey, "action": turnstileAction})
 }
 
 func allCandidateChecks() []model.Check {
@@ -217,8 +228,8 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	// as before. A verification failure is reported to the visitor as
 	// exactly that, not folded into the generic scan-failure path. It still
 	// finishes the reserved row, so the log shows why it never scanned.
-	if s.secretKey != "" {
-		human, verr := verifyTurnstile(ctx, s.secretKey, body.TurnstileToken, ip)
+	if s.turnstile.secret != "" {
+		human, verr := verifyTurnstile(ctx, s.turnstile, body.TurnstileToken, ip)
 		if verr != nil {
 			s.finishScan(ctx, scanID, ScanLogEntry{Err: "turnstile verification unavailable: " + verr.Error()})
 			http.Error(w, "verification check failed — please try again", http.StatusBadGateway)
