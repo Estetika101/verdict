@@ -43,11 +43,48 @@ func (c pageCheck) Run(cc model.CheckContext) ([]model.Finding, error) {
 	return []model.Finding{f}, nil
 }
 
+// pageDataCheck is the page-scoped shape for checks that need more than the
+// parsed DOM — response headers in particular (X-Robots-Tag). Same contract as
+// pageCheck: a pure function of cc.Page(), one Finding per page, never a Fetch.
+type pageDataCheck struct {
+	id    string
+	title string
+	run   func(page model.PageData) model.Finding
+}
+
+func (c pageDataCheck) Meta() model.CheckMeta {
+	return model.CheckMeta{
+		ID: c.id, Module: "geo", Tier: 1, Scope: model.ScopePage,
+		Severity: model.SeverityWarn, Title: c.title,
+	}
+}
+
+func (c pageDataCheck) Run(cc model.CheckContext) ([]model.Finding, error) {
+	page := cc.Page()
+	if page.Doc == nil {
+		return nil, nil // no parsed HTML (non-HTML response); nothing to check
+	}
+	loc := model.Location{URL: pageURL(page)}
+	f := c.run(page)
+	if f.Status == "" {
+		return nil, nil
+	}
+	f.Module, f.Scope, f.Criterion = "geo", model.ScopePage, c.id
+	if f.Location.URL == "" {
+		f.Location = loc
+	}
+	return []model.Finding{f}, nil
+}
+
 // All returns every GEO check.
 func All() []model.Check {
 	return []model.Check{
 		BotPosture(),
 		LLMsTxt(),
 		Freshness(),
+		SnippetControls(),
+		StructuredData(),
+		ServerRenderedText(),
+		ContentSignals(),
 	}
 }
