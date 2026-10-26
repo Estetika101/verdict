@@ -62,8 +62,26 @@ func safeFetch(ctx context.Context, rawURL string) (model.PageData, error) {
 
 	client := &http.Client{
 		Timeout: fetchTimeout,
+		// A fresh Transport is built per scan, so connection reuse buys
+		// nothing and an idle pool is pure leak: with keep-alives on and no
+		// IdleConnTimeout, every scan would leave a connection (and its
+		// goroutines) parked until the remote end closed it — forever, on
+		// a long-lived process. DisableKeepAlives closes the connection when
+		// the response body is closed.
+		//
+		// The remaining fields bound the phases the overall Client.Timeout
+		// would otherwise be the only guard for, and shut off ambient
+		// config: Proxy is nil explicitly so HTTP(S)_PROXY in the
+		// environment can never route a visitor-chosen fetch through a proxy
+		// that sits outside guardedDialContext's view (the dial guard would
+		// then be checking the proxy's IP, not the target's).
 		Transport: &http.Transport{
-			DialContext: guardedDialContext,
+			DialContext:            guardedDialContext,
+			DisableKeepAlives:      true,
+			Proxy:                  nil,
+			TLSHandshakeTimeout:    5 * time.Second,
+			ResponseHeaderTimeout:  fetchTimeout,
+			MaxResponseHeaderBytes: 64 << 10,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= maxRedirects {
@@ -144,8 +162,13 @@ func guardedDialContext(ctx context.Context, network, addr string) (net.Conn, er
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
-		// addr should already be a resolved IP:port by the time the
-		// transport dials; if it's not, resolve it ourselves and check.
+		// The transport hands DialContext the HOSTNAME:port straight from
+		// the URL — it does not pre-resolve — so this is the normal path,
+		// not a fallback. We resolve here, check the result, and then dial
+		// that exact IP (below), so the address that was validated is the
+		// address connected to; a second lookup inside the dialer could
+		// return something different (DNS rebinding). An IP-literal URL
+		// skips the lookup and is validated as-is.
 		addrs, rerr := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if rerr != nil || len(addrs) == 0 {
 			return nil, fmt.Errorf("could not resolve %s at dial time", host)
@@ -159,15 +182,66 @@ func guardedDialContext(ctx context.Context, network, addr string) (net.Conn, er
 	return d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
 }
 
+// disallowedNets are the ranges the net.IP predicates don't cover. Each one
+// is reachable-in-practice SSRF surface or an address that embeds another
+// address and so smuggles a blocked IPv4 target past a check that only looks
+// at the outer IPv6 form:
+//
+//   - 0.0.0.0/8: "this network"; on Linux 0.x.x.x reaches the local host.
+//   - 100.64.0.0/10: carrier-grade NAT (RFC 6598), which includes Alibaba
+//     Cloud's metadata endpoint at 100.100.100.200.
+//   - 192.0.0.0/24: IETF protocol assignments.
+//   - 198.18.0.0/15: benchmarking (RFC 2544); routed internally by some hosts.
+//   - 240.0.0.0/4: reserved, and 255.255.255.255 broadcast.
+//   - 64:ff9b::/96 and 64:ff9b:1::/48: NAT64 — the low 32 bits are an IPv4
+//     address, so 64:ff9b::a9fe:a9fe is 169.254.169.254 on a NAT64 network.
+//   - 2002::/16: 6to4 — the IPv4 address is embedded in bits 16-47.
+//   - 2001::/32: Teredo — embeds a (obfuscated) IPv4 server and client.
+//
+// Parsed once at package init; a bad literal here is a programming error, so
+// it panics at startup rather than silently allowing a range.
+var disallowedNets = mustParseCIDRs(
+	"0.0.0.0/8",
+	"100.64.0.0/10",
+	"192.0.0.0/24",
+	"198.18.0.0/15",
+	"240.0.0.0/4",
+	"64:ff9b::/96",
+	"64:ff9b:1::/48",
+	"2002::/16",
+	"2001::/32",
+)
+
+func mustParseCIDRs(cidrs ...string) []*net.IPNet {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			panic("demo: bad CIDR " + c + ": " + err.Error())
+		}
+		nets = append(nets, n)
+	}
+	return nets
+}
+
 // isDisallowedIP rejects loopback, private (RFC1918/RFC4193), link-local,
-// unspecified, and multicast ranges — the address classes that would let a
+// unspecified, and multicast ranges, plus the reserved and IPv4-embedding
+// ranges in disallowedNets — the address classes that would let a
 // public-internet request reach internal infrastructure (a cloud metadata
 // endpoint, an internal service, the host running this code itself).
 func isDisallowedIP(ip net.IP) bool {
-	return ip.IsLoopback() ||
+	if ip.IsLoopback() ||
 		ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() ||
-		ip.IsMulticast()
+		ip.IsMulticast() {
+		return true
+	}
+	for _, n := range disallowedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }

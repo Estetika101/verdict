@@ -55,9 +55,20 @@ just a flag on it:
   does can trigger a second network call.
 - **Rate-limited** (5 scans/hour/IP by default) and **optionally logs to
   Postgres** (`--database-url`, or `$DATABASE_URL`; a hashed IP, hostname, and
-  finding counts only — no scraped content, no plaintext IP) purely for
+  finding counts only — no scraped content, no plaintext IP; the IP hash
+  is HMAC-SHA256 keyed by `--ip-hash-secret` / `$IP_HASH_SECRET`, because an
+  unkeyed hash of an IPv4 address can be brute-forced in minutes — leave the
+  secret unset and it falls back to the unkeyed hash with a startup warning) purely for
   operator visibility into what's being scanned. Logging is disabled, not
-  fatal, if no database is configured.
+  fatal, if no database is configured. Rate limiting is a reservation against
+  that same log table: one transaction, serialised per IP by a Postgres
+  advisory lock, counts the visitor's recent rows and claims a slot before the
+  scan starts (so concurrent requests can't all slip under the limit). It is
+  deliberately not an in-memory counter — an
+  in-process map can't guarantee a given visitor's requests land on the same
+  warm instance on any elastic/serverless host, so it would silently stop
+  limiting anything the moment that assumption breaks. This also means rate
+  limiting is only active when a database is configured.
 - **Optional Cloudflare Turnstile human verification** (`--turnstile-sitekey`
   / `--turnstile-secret`, or `$TURNSTILE_SITE_KEY` / `$TURNSTILE_SECRET_KEY`).
   Off unless BOTH keys are set — a site key alone would render a widget
@@ -65,16 +76,43 @@ just a flag on it:
   `/api/turnstile-sitekey` and only injects Cloudflare's script if a key comes
   back), so a deploy without Turnstile configured behaves exactly as if this
   feature didn't exist.
+- **Security headers on every response**: a strict Content-Security-Policy
+  (scripts from this origin and Cloudflare Turnstile only), `nosniff`,
+  `X-Frame-Options: DENY`, HSTS, a restrictive Referrer-Policy and
+  Permissions-Policy.
+- **Client IP comes from one trusted header, or none.** By default the rate
+  limiter keys on the connection's address only. Behind a proxy, set
+  `--client-ip-header` (or `$CLIENT_IP_HEADER`) to the single header your edge
+  overwrites on every request: `Fly-Client-IP` on Fly, `X-Real-IP` on Vercel,
+  empty when exposed directly. Any other header is ignored, because trusting
+  one the platform doesn't overwrite lets a visitor pick a fresh rate-limit
+  key per request.
 
 ```sh
 verdict demo --port 8080 \
   --database-url "postgres://…" \
+  --ip-hash-secret "<long random string, kept stable>" \
+  --client-ip-header "Fly-Client-IP" \
   --turnstile-sitekey "0x4..." --turnstile-secret "0x4..."
 ```
 
 `Dockerfile.demo` builds a dedicated image for this — deliberately separate
 from the main `Dockerfile`, so the public-facing process can never accidentally
-ship with the dashboard's config-editing surface reachable.
+ship with the dashboard's config-editing surface reachable. This is the
+self-host path (Fly, a VPS, any container host).
+
+**Deploying to Vercel** is the other option, and needs no separate Dockerfile:
+`cmd/server/main.go` is a second, minimal entrypoint that builds the exact
+same `internal/demo.Server` from environment variables instead of flags
+(`DATABASE_URL`, `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, `PORT`,
+`CLIENT_IP_HEADER`, which defaults to `X-Real-IP` there, and
+`IP_HASH_SECRET`) —
+Vercel's Go Framework Preset auto-detects it, so `vercel.json` only needs
+`"framework": "go"`. Point `DATABASE_URL` at Neon and it's the same
+Postgres-backed logging/rate-limiting as the self-hosted command, just on a
+platform that doesn't guarantee a warm process sticks around between
+requests (which is exactly why the rate limiter is a query against the log
+table rather than in-memory state — see above).
 
 ## Quick start
 
