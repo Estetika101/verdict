@@ -4,8 +4,23 @@
     {
       "name": "verdict-dashboard",
       "runtimeExecutable": "./verdict",
-      "runtimeArgs": ["serve", "--report", "./verdict-report", "--port", "8787"],
+      "runtimeArgs": [
+        "serve",
+        "--report",
+        "./verdict-report",
+        "--port",
+        "8787"
+      ],
       "port": 8787
+    },
+    {
+      "name": "verdict-demo",
+      "runtimeExecutable": "/opt/homebrew/bin/go",
+      "runtimeArgs": [
+        "run",
+        "./cmd/server"
+      ],
+      "port": 8080
     }
   ]
 }
