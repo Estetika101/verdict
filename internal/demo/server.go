@@ -127,8 +127,38 @@ func allCandidateChecks() []model.Check {
 	return all
 }
 
+// contentSecurityPolicy is the demo page's whole policy, kept as one literal
+// so it can be read and diffed as a unit. Scripts load only from this origin
+// (the frontend serves /app.js rather than inlining) plus Cloudflare's
+// Turnstile; styles allow inline for the page's own <style> and Google Fonts'
+// stylesheet, with the font files from gstatic. connect-src 'self' is enough
+// because the page only calls its own /api endpoints. frame-ancestors, base-uri
+// and form-action close the clickjacking, <base>-injection and form-hijack
+// routes that default-src doesn't cover.
+const contentSecurityPolicy = "default-src 'self'; " +
+	"script-src 'self' https://challenges.cloudflare.com; " +
+	"frame-src https://challenges.cloudflare.com; " +
+	"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+	"font-src https://fonts.gstatic.com; " +
+	"img-src 'self' data:; " +
+	"connect-src 'self'; " +
+	"frame-ancestors 'none'; " +
+	"base-uri 'none'; " +
+	"form-action 'self'"
+
+// ServeHTTP sets the security headers on EVERY response — pages, API replies,
+// errors, 404s — by setting them before dispatch rather than per handler, so a
+// new route can't forget them. HSTS is meaningful only over HTTPS and browsers
+// ignore it on plain HTTP, so it is safe to send unconditionally.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("X-Robots-Tag", "noindex") // the scan tool itself isn't a page worth indexing
+	h := w.Header()
+	h.Set("X-Robots-Tag", "noindex") // the scan tool itself isn't a page worth indexing
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+	h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+	h.Set("Content-Security-Policy", contentSecurityPolicy)
 	s.mux.ServeHTTP(w, r)
 }
 

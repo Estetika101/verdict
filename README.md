@@ -76,6 +76,10 @@ just a flag on it:
   `/api/turnstile-sitekey` and only injects Cloudflare's script if a key comes
   back), so a deploy without Turnstile configured behaves exactly as if this
   feature didn't exist.
+- **Security headers on every response**: a strict Content-Security-Policy
+  (scripts from this origin and Cloudflare Turnstile only), `nosniff`,
+  `X-Frame-Options: DENY`, HSTS, a restrictive Referrer-Policy and
+  Permissions-Policy.
 - **Client IP comes from one trusted header, or none.** By default the rate
   limiter keys on the connection's address only. Behind a proxy, set
   `--client-ip-header` (or `$CLIENT_IP_HEADER`) to the single header your edge

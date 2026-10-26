@@ -137,3 +137,38 @@ func TestHandleScan_FailedFetchFinishesRow(t *testing.T) {
 		t.Errorf("row error = %q, want the fetch failure reason", errText)
 	}
 }
+
+// The security headers go on every response, including the API and error
+// paths, not just the static page.
+func TestServeHTTP_SecurityHeaders(t *testing.T) {
+	srv, err := NewServer(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"X-Robots-Tag":              "noindex",
+		"X-Content-Type-Options":    "nosniff",
+		"Referrer-Policy":           "strict-origin-when-cross-origin",
+		"X-Frame-Options":           "DENY",
+		"Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+		"Permissions-Policy":        "camera=(), microphone=(), geolocation=()",
+		"Content-Security-Policy": "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; " +
+			"frame-src https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+			"font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; " +
+			"frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+	}
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/"},
+		{http.MethodGet, "/api/turnstile-sitekey"},
+		{http.MethodGet, "/api/scan"},     // 405
+		{http.MethodGet, "/no-such-file"}, // 404
+	} {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+		for k, v := range want {
+			if got := rec.Header().Get(k); got != v {
+				t.Errorf("%s %s (status %d): %s = %q, want %q", tc.method, tc.path, rec.Code, k, got, v)
+			}
+		}
+	}
+}
